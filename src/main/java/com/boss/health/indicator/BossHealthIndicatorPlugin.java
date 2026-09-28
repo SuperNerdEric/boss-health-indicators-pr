@@ -13,7 +13,9 @@ import com.google.common.reflect.TypeToken;
 import com.google.gson.Gson;
 import com.google.inject.Provides;
 import lombok.extern.slf4j.Slf4j;
+import net.runelite.api.Actor;
 import net.runelite.api.Client;
+import net.runelite.api.NPC;
 import net.runelite.api.events.GameTick;
 import net.runelite.api.widgets.*;
 import net.runelite.client.Notifier;
@@ -28,6 +30,7 @@ import net.runelite.client.ui.ClientToolbar;
 import net.runelite.client.ui.NavigationButton;
 import net.runelite.client.ui.components.colorpicker.ColorPickerManager;
 import net.runelite.client.util.ImageUtil;
+import net.runelite.client.util.Text;
 
 import java.awt.*;
 import java.awt.datatransfer.Clipboard;
@@ -62,6 +65,32 @@ public class BossHealthIndicatorPlugin extends Plugin
 	private static final String CONFIG_GROUP = "bosshealthindicators";
 	private static final String CONFIG_KEY = "indicators";
 
+	// Standard boss HP HUD (interface 303). Used outside Theatre of Blood.
+	private static final int STANDARD_HP_GROUP = 303;
+	private static final int STANDARD_HP_LAYER = 5;
+	private static final int STANDARD_HP_NAME = 9;
+	private static final int STANDARD_HP_BAR = 10;
+	private static final int STANDARD_HP_INNER = 12;
+	private static final int STANDARD_HP_TEXT = 20;
+
+	// Theatre of Blood raid HUD (interface 28). This bar shows a percentage only,
+	// so the boss is identified from the NPC in the room.
+	private static final int TOB_HUD_GROUP = 28;
+	private static final int TOB_PROGRESS_CONTAINER = 9;
+	private static final int TOB_PROGRESS_BAR = 36;
+	private static final int TOB_WAVE_TYPE_VARBIT = 6447;
+	private static final int TOB_HP_VARBIT = 6448;
+	private static final int TOB_HP_MAX_VARBIT = 6449;
+
+	static final Set<String> TOB_BOSS_NAMES = new HashSet<String>(Arrays.asList(
+		"The Maiden of Sugadinti",
+		"Pestilent Bloat",
+		"Nylocas Vasilias",
+		"Sotetseg",
+		"Xarpus",
+		"Verzik Vitur"
+	));
+
 	private NavigationButton navButton;
 	private BossHealthIndicatorPanel panel;
 
@@ -77,6 +106,8 @@ public class BossHealthIndicatorPlugin extends Plugin
 
 	List<Widget> activeBars;
 	List<BossIndicators> activeBoss;
+	private Widget activeBarWidget;
+	private int activeBarWidth;
 
 	@Provides
 	BossHealthIndicatorConfig provideConfig(ConfigManager configManager)
@@ -102,6 +133,8 @@ public class BossHealthIndicatorPlugin extends Plugin
 
 		activeBars = new ArrayList<Widget>();
 		activeBoss = null;
+		activeBarWidget = null;
+		activeBarWidth = 0;
 		lastBossHealthPercentage = null;
 
 		// Set up side panel
@@ -123,66 +156,109 @@ public class BossHealthIndicatorPlugin extends Plugin
 	{
 		clientToolbar.removeNavigation(navButton);
 		activeBoss = null;
+		activeBarWidget = null;
+		activeBarWidth = 0;
 		clientThread.invoke(() -> clearBars());
 	}
 
-	private void handleHealthNotification() {
+	private void handleHealthNotification(HealthBarTarget target) {
 		if(activeBoss == null) {
 			return;
 		}
-		Widget healthBarHealthTextWidget = client.getWidget(303, 20);
-		if(healthBarHealthTextWidget == null ) { return; }
-		if(!healthBarHealthTextWidget.isHidden()) {
-			String bossHealthText = healthBarHealthTextWidget.getText();
-			String[] numbers = bossHealthText.split(" / ");
-			try {
-				int numerator = Integer.parseInt(numbers[0]);
-				int denominator = Integer.parseInt(numbers[1].contains("%") ? (numbers[1].split(" "))[0] : numbers[1]);
-				double percentHealth = ((double)numerator) / denominator;
-				final boolean forceCheck = lastBossHealthPercentage == null || percentHealth > lastBossHealthPercentage;
-				if (forceCheck) {
-					lastBossHealthPercentage = percentHealth;
+		Double percentHealth = readHealthFraction(target);
+		if(percentHealth == null) {
+			return;
+		}
+		final boolean forceCheck = lastBossHealthPercentage == null || percentHealth > lastBossHealthPercentage;
+		if (forceCheck) {
+			lastBossHealthPercentage = percentHealth;
+		}
+
+		final double healthFraction = percentHealth;
+		activeBoss.forEach((indicatorSet -> {
+			indicatorSet.getEntries().forEach(indicator -> {
+				if(!indicator.getNotify()) {
+					return;
 				}
+				if(
+					((forceCheck) && healthFraction == indicator.getPercentage()) ||
+						(healthFraction <= indicator.getPercentage() && indicator.getPercentage() < lastBossHealthPercentage))
+				{
+					notifier.notify(String.format("%s's health has reached %s!", indicatorSet.getBossName(), percentageFormat.format(indicator.getPercentage())));
+				}
+			});
+		}));
 
-				activeBoss.forEach((indicatorSet -> {
-					indicatorSet.getEntries().forEach(indicator -> {
-						if(!indicator.getNotify()) {
-							return;
-						}
-						if(
-							((forceCheck) && percentHealth == indicator.getPercentage()) ||
-								(percentHealth <= indicator.getPercentage() && indicator.getPercentage() < lastBossHealthPercentage))
-						{
-							notifier.notify(String.format("%s's health has reached %s!", indicatorSet.getBossName(), percentageFormat.format(indicator.getPercentage())));
-						}
-					});
-				}));
+		lastBossHealthPercentage = healthFraction;
+	}
 
-
-				lastBossHealthPercentage = percentHealth;
-			} catch (NumberFormatException e) {
-				// Couldn't get health numbers
+	private Double readHealthFraction(HealthBarTarget target) {
+		if(target.theatreOfBlood) {
+			int max = client.getVarbitValue(TOB_HP_MAX_VARBIT);
+			if(max <= 0) {
+				return null;
 			}
+			return client.getVarbitValue(TOB_HP_VARBIT) / (double) max;
+		}
+
+		Widget healthBarHealthTextWidget = client.getWidget(STANDARD_HP_GROUP, STANDARD_HP_TEXT);
+		if(healthBarHealthTextWidget == null || healthBarHealthTextWidget.isHidden()) {
+			return null;
+		}
+		String[] numbers = healthBarHealthTextWidget.getText().split(" / ");
+		try {
+			int numerator = Integer.parseInt(numbers[0]);
+			int denominator = Integer.parseInt(numbers[1].contains("%") ? (numbers[1].split(" "))[0] : numbers[1]);
+			return ((double) numerator) / denominator;
+		} catch (NumberFormatException | ArrayIndexOutOfBoundsException e) {
+			return null;
 		}
 	}
 
 	private List<BossIndicators> getMatchingIndicators(String bossName) {
 		ArrayList<BossIndicators> returnList = new ArrayList<>();
+		if(bossName == null || mapping == null) {
+			return returnList;
+		}
 		mapping.forEach((name, indicator) -> {
-			try {
-				// Turn the database boss name into a regular expression to compare against provided boss name
-				Pattern pattern = Pattern.compile(name);
-				Matcher matcher = pattern.matcher(bossName);
-				if (matcher.matches()) {
-					returnList.add(indicator);
-				} else {
-					// Nothing
-				}
-			} catch(PatternSyntaxException e) {
-				// Pattern was invalid, do nothing.
+			if(nameMatches(name, bossName)) {
+				returnList.add(indicator);
 			}
 		});
 		return returnList;
+	}
+
+	static boolean nameMatches(String patternText, String bossName) {
+		try {
+			Pattern pattern = Pattern.compile(patternText);
+			Matcher matcher = pattern.matcher(bossName);
+			return matcher.matches();
+		} catch(PatternSyntaxException e) {
+			return false;
+		}
+	}
+
+	/**
+	 * Picks the Theatre of Blood boss whose health the raid bar is showing.
+	 * Adds such as Nylocas Matomenos are ignored. If two different bosses are
+	 * alive and the player is not attacking one of them, no name is returned.
+	 */
+	static String selectTobBossName(Iterable<String> aliveNpcNames, String interactingName) {
+		if(interactingName != null && TOB_BOSS_NAMES.contains(interactingName)) {
+			return interactingName;
+		}
+		String match = null;
+		for(String name : aliveNpcNames) {
+			if(name == null || !TOB_BOSS_NAMES.contains(name)) {
+				continue;
+			}
+			if(match == null) {
+				match = name;
+			} else if(!match.equals(name)) {
+				return null;
+			}
+		}
+		return match;
 	}
 
 	private boolean areBossListsIdentical(List<BossIndicators> a, List<BossIndicators> b) {
@@ -202,25 +278,127 @@ public class BossHealthIndicatorPlugin extends Plugin
 	@Subscribe
 	public void onGameTick(GameTick tick)
 	{
-		Widget healthBarNameTextWidget = client.getWidget(303, 9);
-		// TODO: this might not be necessary
-		if(healthBarNameTextWidget != null) {
-			// TODO: this will loop on null over and over again
-			// Get current boss, if there is any
-			String bossName = healthBarNameTextWidget.getText();
-			List<BossIndicators> newIndicators = getMatchingIndicators(bossName);
-			if(activeBoss == null || !areBossListsIdentical(activeBoss, newIndicators)) {
+		HealthBarTarget target = findHealthBarTarget();
+		if(target == null) {
+			if(activeBoss != null) {
 				clearBars();
-				if(newIndicators.size() > 0) {
-					BossIndicators data = mapping.get(bossName);
-					activeBoss = newIndicators;
-					createBars();
-				} else {
-					activeBoss = null;
-				}
+				clearActiveTarget();
 			}
-			handleHealthNotification();
+			return;
 		}
+
+		List<BossIndicators> newIndicators = getMatchingIndicators(target.bossName);
+		int barWidth = target.barWidget.getWidth();
+		boolean targetChanged = activeBoss == null
+			|| activeBarWidget != target.barWidget
+			|| activeBarWidth != barWidth
+			|| !areBossListsIdentical(activeBoss, newIndicators);
+		if(targetChanged) {
+			clearBars();
+			lastBossHealthPercentage = null;
+			if(newIndicators.size() > 0 && barWidth > 0) {
+				activeBoss = newIndicators;
+				activeBarWidget = target.barWidget;
+				activeBarWidth = barWidth;
+				createBars(target);
+			} else {
+				clearActiveTarget();
+			}
+		}
+		if(activeBoss != null) {
+			handleHealthNotification(target);
+		}
+	}
+
+	private HealthBarTarget findHealthBarTarget() {
+		HealthBarTarget standard = standardHealthBar();
+		if(standard != null && getMatchingIndicators(standard.bossName).size() > 0) {
+			return standard;
+		}
+		HealthBarTarget theatre = theatreHealthBar();
+		if(theatre != null && getMatchingIndicators(theatre.bossName).size() > 0) {
+			return theatre;
+		}
+		return standard;
+	}
+
+	private HealthBarTarget standardHealthBar() {
+		Widget hp = client.getWidget(STANDARD_HP_GROUP, STANDARD_HP_LAYER);
+		Widget nameWidget = client.getWidget(STANDARD_HP_GROUP, STANDARD_HP_NAME);
+		Widget inner = client.getWidget(STANDARD_HP_GROUP, STANDARD_HP_INNER);
+		Widget bar = client.getWidget(STANDARD_HP_GROUP, STANDARD_HP_BAR);
+		if(hp == null || hp.isHidden() || nameWidget == null || inner == null || bar == null) {
+			return null;
+		}
+		String bossName = normalizeName(nameWidget.getText());
+		if(bossName.isEmpty() || "-".equals(bossName)) {
+			return null;
+		}
+		int height = bar.getOriginalHeight();
+		if(height <= 0) {
+			height = bar.getHeight();
+		}
+		return new HealthBarTarget(bossName, false, inner, height);
+	}
+
+	private HealthBarTarget theatreHealthBar() {
+		Widget container = client.getWidget(TOB_HUD_GROUP, TOB_PROGRESS_CONTAINER);
+		Widget bar = client.getWidget(TOB_HUD_GROUP, TOB_PROGRESS_BAR);
+		if(container == null || container.isHidden() || bar == null || client.getVarbitValue(TOB_WAVE_TYPE_VARBIT) == 0) {
+			return null;
+		}
+		String bossName = selectTobBossName(aliveNpcNames(), interactingNpcName());
+		if(bossName == null) {
+			return null;
+		}
+		int height = bar.getHeight();
+		if(height <= 0) {
+			height = container.getHeight();
+		}
+		return new HealthBarTarget(bossName, true, bar, height);
+	}
+
+	private List<String> aliveNpcNames() {
+		List<String> names = new ArrayList<String>();
+		if(client.getNpcs() == null) {
+			return names;
+		}
+		for(NPC npc : client.getNpcs()) {
+			if(npc == null || npc.isDead()) {
+				continue;
+			}
+			String name = normalizeName(npc.getName());
+			if(!name.isEmpty()) {
+				names.add(name);
+			}
+		}
+		return names;
+	}
+
+	private String interactingNpcName() {
+		if(client.getLocalPlayer() == null) {
+			return null;
+		}
+		Actor interacting = client.getLocalPlayer().getInteracting();
+		if(!(interacting instanceof NPC) || ((NPC) interacting).isDead()) {
+			return null;
+		}
+		String name = normalizeName(((NPC) interacting).getName());
+		return name.isEmpty() ? null : name;
+	}
+
+	private static String normalizeName(String name) {
+		if(name == null) {
+			return "";
+		}
+		return Text.removeTags(name).trim();
+	}
+
+	private void clearActiveTarget() {
+		activeBoss = null;
+		activeBarWidget = null;
+		activeBarWidth = 0;
+		lastBossHealthPercentage = null;
 	}
 
 	// Deletes all active bar widgets
@@ -234,14 +412,10 @@ public class BossHealthIndicatorPlugin extends Plugin
 
 	// Creates the appropriate indicator bars as children of the healthbar widget
 	// Assumes activeBoss is set and not null
-	void createBars() {
-		//Widget parent = client.getWidget(303, 10);
-		Widget parent = client.getWidget(303, 12);
-		int height = client.getWidget(303, 10).getOriginalHeight();
-
+	void createBars(HealthBarTarget target) {
 		for(BossIndicators bossIndicators : activeBoss) {
 			for(Indicator indicator : bossIndicators.getEntries()) {
-				Widget bar = createBarWidget(parent, indicator.getColor(), indicator.getPercentage(), height);
+				Widget bar = createBarWidget(target.barWidget, indicator.getColor(), indicator.getPercentage(), target.markerHeight);
 				activeBars.add(bar);
 			}
 		}
@@ -392,5 +566,19 @@ public class BossHealthIndicatorPlugin extends Plugin
 
 	public void moveCreator(BossIndicatorCreator creator, int amount) {
 		panel.moveCreator(creator, amount);
+	}
+
+	private static final class HealthBarTarget {
+		private final String bossName;
+		private final boolean theatreOfBlood;
+		private final Widget barWidget;
+		private final int markerHeight;
+
+		private HealthBarTarget(String bossName, boolean theatreOfBlood, Widget barWidget, int markerHeight) {
+			this.bossName = bossName;
+			this.theatreOfBlood = theatreOfBlood;
+			this.barWidget = barWidget;
+			this.markerHeight = markerHeight;
+		}
 	}
 }
