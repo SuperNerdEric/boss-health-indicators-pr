@@ -82,7 +82,7 @@ public class BossHealthIndicatorPlugin extends Plugin
 	private static final int TOB_HP_VARBIT = 6448;
 	private static final int TOB_HP_MAX_VARBIT = 6449;
 
-	static final Set<String> TOB_BOSS_NAMES = new HashSet<String>(Arrays.asList(
+	private static final Set<String> TOB_BOSS_NAMES = new HashSet<String>(Arrays.asList(
 		"The Maiden of Sugadinti",
 		"Pestilent Bloat",
 		"Nylocas Vasilias",
@@ -228,7 +228,7 @@ public class BossHealthIndicatorPlugin extends Plugin
 		return returnList;
 	}
 
-	static boolean nameMatches(String patternText, String bossName) {
+	private static boolean nameMatches(String patternText, String bossName) {
 		try {
 			Pattern pattern = Pattern.compile(patternText);
 			Matcher matcher = pattern.matcher(bossName);
@@ -243,7 +243,7 @@ public class BossHealthIndicatorPlugin extends Plugin
 	 * Adds such as Nylocas Matomenos are ignored. If two different bosses are
 	 * alive and the player is not attacking one of them, no name is returned.
 	 */
-	static String selectTobBossName(Iterable<String> aliveNpcNames, String interactingName) {
+	private static String selectTobBossName(Iterable<String> aliveNpcNames, String interactingName) {
 		if(interactingName != null && TOB_BOSS_NAMES.contains(interactingName)) {
 			return interactingName;
 		}
